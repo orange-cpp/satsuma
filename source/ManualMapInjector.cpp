@@ -8,6 +8,9 @@
 #include <memory>
 #include <Windows.h>
 #include <thread>
+#include <fstream>
+#include <filesystem>
+
 
 
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
@@ -57,28 +60,28 @@ void satsuma::ManualMapInjector::MaybeRelocate(const std::unique_ptr<uint8_t[]> 
     const uintptr_t diff = reinterpret_cast<uintptr_t>(image.get()) - ntHeaders->OptionalHeader.ImageBase;
 
     if (diff == 0)
-        assert(false);
+        return;
 
     const auto& baseReloc = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
-    if (baseReloc.Size == 0)
-        assert(false);
+    if (!baseReloc.Size)
+        return;
 
-    auto* pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.get() + baseReloc.VirtualAddress);
-    while (pRelocData->SizeOfBlock)
+    auto* currentBaseRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>(image.get() + baseReloc.VirtualAddress);
+    while (currentBaseRelocation->SizeOfBlock && currentBaseRelocation->VirtualAddress)
     {
-        const size_t entries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-        auto pRelativeInfo = reinterpret_cast<uint16_t*>(pRelocData + 1);
+        const size_t entries = (currentBaseRelocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        auto relativeInfo = reinterpret_cast<uint16_t*>(currentBaseRelocation + 1);
 
-        for (size_t i = 0; i != entries; ++i, ++pRelativeInfo)
+        for (size_t i = 0; i <= entries; i++, relativeInfo++)
         {
-            if (RELOC_FLAG(*pRelativeInfo)) {
-                auto* pPatch = reinterpret_cast<uintptr_t*>(image.get() + pRelocData->VirtualAddress + (*pRelativeInfo & 0xFFF));
+            if (!RELOC_FLAG(*relativeInfo))
+                continue;
 
-                *pPatch += static_cast<uintptr_t>(diff);
-            }
+            auto* pPatch = reinterpret_cast<uintptr_t*>(image.get() + currentBaseRelocation->VirtualAddress + (*relativeInfo & 0xFFF));
+            *pPatch += static_cast<uintptr_t>(diff);
         }
-        pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
+        currentBaseRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(currentBaseRelocation) + currentBaseRelocation->SizeOfBlock);
     }
 }
 
@@ -100,65 +103,65 @@ void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, con
 }
 
 
-void satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t[]> &image)
+bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t[]> &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
 
-    auto pIID = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(image.get() + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    auto importDescriptor = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(image.get() + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 
-    // Resolve DLL imports
-    while (pIID->Characteristics)
+    while (importDescriptor->Characteristics)
     {
-        auto OrigFirstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(image.get() + pIID->OriginalFirstThunk);
-        auto FirstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(image.get() + pIID->FirstThunk);
+        auto origFirstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(image.get() + importDescriptor->OriginalFirstThunk);
+        auto firstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(image.get() + importDescriptor->FirstThunk);
 
-        const HMODULE hModule = LoadLibraryA(reinterpret_cast<LPCSTR>(image.get()) + pIID->Name);
+        const HMODULE hModule = LoadLibraryA(reinterpret_cast<LPCSTR>(image.get()) + importDescriptor->Name);
 
         if (!hModule)
-            assert(false);
+            return false;
 
-        while (OrigFirstThunk->u1.AddressOfData)
+        while (origFirstThunk->u1.AddressOfData)
         {
-            if (OrigFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+            if (origFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
             {
-                const auto ordinal = reinterpret_cast<uintptr_t>(GetProcAddress(hModule, reinterpret_cast<LPCSTR>(OrigFirstThunk->u1.Ordinal & 0xFFFF)));
+                const auto ordinal = GetProcAddress(hModule, reinterpret_cast<LPCSTR>(origFirstThunk->u1.Ordinal & 0xFFFF));
 
                 if (!ordinal)
-                    assert(false);
+                    return false;
 
-                FirstThunk->u1.Function = ordinal;
+                firstThunk->u1.Function = reinterpret_cast<uintptr_t>(ordinal);
             }
             else
             {
-                auto ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(image.get() + OrigFirstThunk->u1.AddressOfData);
-                auto function = reinterpret_cast<uintptr_t>(GetProcAddress(hModule, ibn->Name));
+                auto ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(image.get() + origFirstThunk->u1.AddressOfData);
+                const auto function = GetProcAddress(hModule, ibn->Name);
 
                 if (!function)
-                    assert(false);
+                    return false;
 
-                FirstThunk->u1.Function = function;
+                firstThunk->u1.Function = reinterpret_cast<uintptr_t>(function);
             }
-            OrigFirstThunk++;
-            FirstThunk++;
+            origFirstThunk++;
+            firstThunk++;
         }
-        pIID++;
+        importDescriptor++;
     }
+    return true;
 }
 
-void satsuma::ManualMapInjector::CallTLSCallbacks(const std::unique_ptr<uint8_t[]> &image)
+void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]> &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
-    const auto& tlsDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    const auto& [VirtualAddress, Size] = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
 
-    if (!tlsDir.Size)
+    if (!Size)
         return;
 
-    const auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(image.get() + tlsDir.VirtualAddress);
-    const auto* callBack = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+    const auto* tlsDirectory = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(image.get() + VirtualAddress);
+    const auto* callBack = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tlsDirectory->AddressOfCallBacks);
 
     for (; callBack && *callBack; callBack++)
         (*callBack)(image.get(), DLL_PROCESS_ATTACH, nullptr);
@@ -170,29 +173,31 @@ void satsuma::ManualMapInjector::EnableExceptions(const std::unique_ptr<uint8_t[
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
-    auto excep = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if (!excep.Size)
+    const auto& [VirtualAddress, Size] = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!Size)
         return;
     RtlAddFunctionTable(
-            reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(image.get() + excep.VirtualAddress),
-            excep.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), reinterpret_cast<uintptr_t>(image.get()));
+            reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(image.get() + VirtualAddress),
+            Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), reinterpret_cast<uintptr_t>(image.get()));
 }
 
-std::function<int(HMODULE, DWORD, LPVOID)> satsuma::ManualMapInjector::GetEntryPoint(
-    const std::unique_ptr<uint8_t[]> &image)
+std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInjector::MaybeGetEntryPoint(const std::unique_ptr<uint8_t[]>& image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
     typedef int(__stdcall* dllmain)(HMODULE, DWORD, LPVOID);
 
+    if (!ntHeaders->OptionalHeader.AddressOfEntryPoint)
+        return std::nullopt;
+
     return reinterpret_cast<dllmain>(image.get() + ntHeaders->OptionalHeader.AddressOfEntryPoint);
 }
 
-std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll, const std::string &processName) const
+std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll) const
 {
     if (!IsPortableExecutable(rawDll))
-        return nullptr;
+        return std::unexpected("File is not in a Portable Executable format");
 
     auto imageBaseAddress = AllocatePortableExecutableImage(rawDll);
 
@@ -202,16 +207,29 @@ std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::InjectFromRaw(const std::
 
     CopyPages(rawDll, imageBaseAddress);
     MaybeRelocate(imageBaseAddress);
-    CreateImportTable(imageBaseAddress);
-    CallTLSCallbacks(imageBaseAddress);
+
+    if (!CreateImportTable(imageBaseAddress))
+        return std::unexpected("Failed to create Import Table");
+
+    MaybeCallTLSCallbacks(imageBaseAddress);
     EnableExceptions(imageBaseAddress);
 
-    std::thread(GetEntryPoint(imageBaseAddress), reinterpret_cast<HMODULE>(imageBaseAddress.get()), DLL_PROCESS_ATTACH, nullptr).join();
+    if (const auto entryPoint = MaybeGetEntryPoint(imageBaseAddress))
+        std::thread(*entryPoint, reinterpret_cast<HMODULE>(imageBaseAddress.get()), DLL_PROCESS_ATTACH, nullptr).join();
 
     return imageBaseAddress;
 }
 
-std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll, const std::string &processName) const
+std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll) const
 {
-    return nullptr;
+    std::vector<uint8_t> data(std::filesystem::file_size(pathToDll), 0);
+
+    std::ifstream file(pathToDll, std::ios::binary);
+
+    if (!file.is_open())
+        return nullptr;
+
+    file.read(reinterpret_cast<char *>(data.data()), data.size());
+
+    return InjectFromRaw({data.data(), data.size()});
 }
