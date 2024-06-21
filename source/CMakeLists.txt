@@ -1,0 +1,1 @@
+target_sources(satsuma PRIVATE Injector.cpp ManualMapInjector.cpp)
