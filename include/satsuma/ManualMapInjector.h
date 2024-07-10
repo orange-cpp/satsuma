@@ -13,33 +13,33 @@
 
 namespace satsuma
 {
-    class ManualMapInjector final : public Injector
+    class ManualMapInjector final
     {
     public:
         [[nodiscard]]
-        std::expected<std::unique_ptr<uint8_t[]>, std::string> InjectFromRaw(const std::span<uint8_t> &rawDll) const override;
+        static std::expected<std::unique_ptr<uint8_t[]>, std::string> InjectFromRaw(const std::span<uint8_t> &rawDll);
 
         [[nodiscard]]
-        std::expected<std::unique_ptr<uint8_t[]>, std::string>  InjectFromFile(const std::string &pathToDll) const override;
+        static std::expected<std::unique_ptr<uint8_t[]>, std::string>  InjectFromFile(const std::string &pathToDll);
 
     private:
         [[nodiscard]]
-        static bool IsPortableExecutable(const std::span<uint8_t> &rawDll);
+        static bool __declspec(noinline) IsPortableExecutable(const std::span<uint8_t> &rawDll);
 
         [[nodiscard]]
-        static std::unique_ptr<uint8_t[]> AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll);
+        static __declspec(noinline) std::unique_ptr<uint8_t[]> AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll);
 
 
-        static void MaybeRelocate(const std::unique_ptr<uint8_t[]>& image);
+        static __declspec(noinline) void MaybeRelocate(const std::unique_ptr<uint8_t[]>& image);
 
-        static void CopyPages(const std::span<uint8_t> & rawDll, const std::unique_ptr<uint8_t[]>& image);
+        static __declspec(noinline) void CopyPages(const std::span<uint8_t> & rawDll, const std::unique_ptr<uint8_t[]>& image);
 
         [[nodiscard]]
-        static bool CreateImportTable(const std::unique_ptr<uint8_t[]>& image);
+        static __declspec(noinline) bool CreateImportTable(const std::unique_ptr<uint8_t[]>& image);
 
-        static void MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]>& image);
+        static __declspec(noinline) void MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]>& image);
 
-        static void EnableExceptions(const std::unique_ptr<uint8_t[]>& image);
+        static __declspec(noinline) void EnableExceptions(const std::unique_ptr<uint8_t[]>& image);
 
         [[nodiscard]]
         static std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> MaybeGetEntryPoint(const std::unique_ptr<uint8_t[]>& image);

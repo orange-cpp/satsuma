@@ -1,6 +1,8 @@
 //
 // Created by Vlad on 6/21/2024.
 //
+#include "satsuma/xorstr.h"
+
 #include "satsuma/ManualMapInjector.h"
 
 #include <algorithm>
@@ -10,20 +12,27 @@
 #include <thread>
 #include <fstream>
 #include <filesystem>
-
-
-
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
 #define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
 
 #ifdef _WIN64
-#define RELOC_FLAG RELOC_FLAG64
+#   define RELOC_FLAG RELOC_FLAG64
 #else
-#define RELOC_FLAG RELOC_FLAG32
+#   define RELOC_FLAG RELOC_FLAG32
 #endif
+
+#ifndef USE_VIRTUALIZER
+#   define VIRTUALIZER_START
+#   define VIRTUALIZER_END
+#else
+#   include <CodeVirtualizer/VirtualizerSDK.h>
+#endif
+
 
 bool satsuma::ManualMapInjector::IsPortableExecutable(const std::span<uint8_t> &rawDll)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
 
     if (dosHeaders->e_magic != 0x5A4D)
@@ -34,11 +43,14 @@ bool satsuma::ManualMapInjector::IsPortableExecutable(const std::span<uint8_t> &
     if (ntHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
         return false;
 
+    VIRTUALIZER_END
     return true;
 }
 
 std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data()+dosHeaders->e_lfanew);
 
@@ -49,11 +61,14 @@ std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::AllocatePortableExecutabl
 
     DWORD oldProc;
     VirtualProtect(imageBaseAddress.get(), ntHeaders->OptionalHeader.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProc);
+
+    VIRTUALIZER_END
     return imageBaseAddress;
 }
 
 void satsuma::ManualMapInjector::MaybeRelocate(const std::unique_ptr<uint8_t[]> &image)
 {
+    VIRTUALIZER_START
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
@@ -83,10 +98,13 @@ void satsuma::ManualMapInjector::MaybeRelocate(const std::unique_ptr<uint8_t[]> 
         }
         currentBaseRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(currentBaseRelocation) + currentBaseRelocation->SizeOfBlock);
     }
+    VIRTUALIZER_END
 }
 
 void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, const std::unique_ptr<uint8_t[]> &image)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data()+dosHeaders->e_lfanew);
 
@@ -100,11 +118,14 @@ void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, con
         std::ranges::copy_n(rawDll.data() + currentSection->PointerToRawData,
                             currentSection->SizeOfRawData, image.get() + currentSection->VirtualAddress);
     }
+    VIRTUALIZER_END
 }
 
 
 bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t[]> &image)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
@@ -134,7 +155,7 @@ bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t
             }
             else
             {
-                auto ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(image.get() + origFirstThunk->u1.AddressOfData);
+                const auto ibn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(image.get() + origFirstThunk->u1.AddressOfData);
                 const auto function = GetProcAddress(hModule, ibn->Name);
 
                 if (!function)
@@ -147,11 +168,14 @@ bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t
         }
         importDescriptor++;
     }
+    VIRTUALIZER_END
     return true;
 }
 
 void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]> &image)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
@@ -166,23 +190,30 @@ void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const std::unique_ptr<uin
     for (; callBack && *callBack; callBack++)
         (*callBack)(image.get(), DLL_PROCESS_ATTACH, nullptr);
 
+    VIRTUALIZER_END
 }
 
 void satsuma::ManualMapInjector::EnableExceptions(const std::unique_ptr<uint8_t[]> &image)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
     const auto& [VirtualAddress, Size] = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (!Size)
         return;
-    RtlAddFunctionTable(
+    auto result = RtlAddFunctionTable(
             reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(image.get() + VirtualAddress),
             Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), reinterpret_cast<uintptr_t>(image.get()));
+
+    VIRTUALIZER_END
 }
 
 std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInjector::MaybeGetEntryPoint(const std::unique_ptr<uint8_t[]>& image)
 {
+    VIRTUALIZER_START
+
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
 
@@ -191,13 +222,16 @@ std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInje
     if (!ntHeaders->OptionalHeader.AddressOfEntryPoint)
         return std::nullopt;
 
+    VIRTUALIZER_END
+
     return reinterpret_cast<dllmain>(image.get() + ntHeaders->OptionalHeader.AddressOfEntryPoint);
 }
 
-std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll) const
+std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll)
 {
+    VIRTUALIZER_START
     if (!IsPortableExecutable(rawDll))
-        return std::unexpected("File is not in a Portable Executable format");
+        return std::unexpected(xorstr_("File is not in a Portable Executable format"));
 
     auto imageBaseAddress = AllocatePortableExecutableImage(rawDll);
 
@@ -209,7 +243,7 @@ std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInject
     MaybeRelocate(imageBaseAddress);
 
     if (!CreateImportTable(imageBaseAddress))
-        return std::unexpected("Failed to create Import Table");
+        return std::unexpected(xorstr_("Failed to create Import Table"));
 
     MaybeCallTLSCallbacks(imageBaseAddress);
     EnableExceptions(imageBaseAddress);
@@ -217,11 +251,15 @@ std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInject
     if (const auto entryPoint = MaybeGetEntryPoint(imageBaseAddress))
         std::thread(*entryPoint, reinterpret_cast<HMODULE>(imageBaseAddress.get()), DLL_PROCESS_ATTACH, nullptr).join();
 
+    VIRTUALIZER_END
+
     return imageBaseAddress;
 }
 
-std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll) const
+std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll)
 {
+    VIRTUALIZER_START
+
     std::vector<uint8_t> data(std::filesystem::file_size(pathToDll), 0);
 
     std::ifstream file(pathToDll, std::ios::binary);
@@ -230,6 +268,8 @@ std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInject
         return nullptr;
 
     file.read(reinterpret_cast<char *>(data.data()), data.size());
+
+    VIRTUALIZER_END
 
     return InjectFromRaw({data.data(), data.size()});
 }
