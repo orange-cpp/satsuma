@@ -24,22 +24,22 @@ namespace satsuma
 
     private:
         [[nodiscard]]
-        static bool __declspec(noinline) IsPortableExecutable(const std::span<uint8_t> &rawDll);
+        static bool IsPortableExecutable(const std::span<uint8_t> &rawDll);
 
         [[nodiscard]]
-        static __declspec(noinline) std::unique_ptr<uint8_t[]> AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll);
+        static std::unique_ptr<uint8_t[]> AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll);
 
 
-        static __declspec(noinline) void MaybeRelocate(const std::unique_ptr<uint8_t[]>& image);
+        static void MaybeRelocate(const std::unique_ptr<uint8_t[]>& image);
 
-        static __declspec(noinline) void CopyPages(const std::span<uint8_t> & rawDll, const std::unique_ptr<uint8_t[]>& image);
+        static void CopyPages(const std::span<uint8_t> & rawDll, const std::unique_ptr<uint8_t[]>& image);
 
         [[nodiscard]]
-        static __declspec(noinline) bool CreateImportTable(const std::unique_ptr<uint8_t[]>& image);
+        static bool CreateImportTable(const std::unique_ptr<uint8_t[]>& image);
 
-        static __declspec(noinline) void MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]>& image);
+        static void MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]>& image);
 
-        static __declspec(noinline) void EnableExceptions(const std::unique_ptr<uint8_t[]>& image);
+        static void EnableExceptions(const std::unique_ptr<uint8_t[]>& image);
 
         [[nodiscard]]
         static std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> MaybeGetEntryPoint(const std::unique_ptr<uint8_t[]>& image);

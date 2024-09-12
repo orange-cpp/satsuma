@@ -2,15 +2,9 @@ cmake_minimum_required(VERSION 3.28)
 project(mmap)
 
 set(CMAKE_CXX_STANDARD 26)
-option(CODE_VIRTUALIZER_SUPPORT OFF)
 
-add_executable(satsuma main.cpp)
+add_library(satsuma source/ManualMapInjector.cpp)
+
 add_subdirectory(source)
-add_subdirectory(extlibs)
-target_include_directories(satsuma PUBLIC include)
-target_link_options(satsuma PRIVATE /MAP:satsuma.map)
-target_link_libraries(satsuma PRIVATE cv-sdk)
 
-if(CODE_VIRTUALIZER_SUPPORT)
-    target_compile_definitions(satsuma PRIVATE USE_VIRTUALIZER)
-endif ()
+target_include_directories(satsuma PUBLIC include)
