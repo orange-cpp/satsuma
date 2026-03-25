@@ -39,6 +39,8 @@ namespace satsuma
 
         static void MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]>& image);
 
+        static bool HandleStaticTLS(const std::unique_ptr<uint8_t[]>& image);
+
         static void EnableExceptions(const std::unique_ptr<uint8_t[]>& image);
 
         [[nodiscard]]

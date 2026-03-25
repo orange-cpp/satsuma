@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/orange/CLionProjects/satsuma -type f -name *.md -o -name *.txt -o -name README*)",
+      "Bash(cmake --build build --config Release)",
+      "Bash(where cmake.exe)",
+      "Read(//c/Program Files/CMake/bin/**)",
+      "Read(//c/Program Files/Microsoft Visual Studio/**)"
+    ]
+  }
+}

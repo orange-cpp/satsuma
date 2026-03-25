@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <memory>
 #include <Windows.h>
+#include <winternl.h>
 #include <thread>
 #include <fstream>
 #include <filesystem>
@@ -18,6 +20,116 @@
 #else
 #   define RELOC_FLAG RELOC_FLAG32
 #endif
+
+namespace {
+
+// Extended LDR_DATA_TABLE_ENTRY with fields needed by LdrpHandleTlsData.
+// The winternl.h definition is incomplete — this covers the layout up through TlsIndex.
+struct LDR_DATA_TABLE_ENTRY_FULL {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    ULONG Flags;
+    USHORT ObsoleteLoadCount;
+    USHORT TlsIndex;
+    LIST_ENTRY HashLinks;
+    ULONG TimeDateStamp;
+};
+
+using LdrpHandleTlsDataFn = NTSTATUS(NTAPI*)(LDR_DATA_TABLE_ENTRY_FULL*);
+
+uint8_t* PatternScan(uint8_t* base, size_t size, const uint8_t* pattern, const char* mask)
+{
+    const size_t patternLen = std::strlen(mask);
+    if (size < patternLen)
+        return nullptr;
+
+    for (size_t i = 0; i <= size - patternLen; i++)
+    {
+        bool found = true;
+        for (size_t j = 0; j < patternLen; j++)
+        {
+            if (mask[j] != '?' && pattern[j] != base[i + j])
+            {
+                found = false;
+                break;
+            }
+        }
+        if (found)
+            return base + i;
+    }
+    return nullptr;
+}
+
+LdrpHandleTlsDataFn FindLdrpHandleTlsData()
+{
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return nullptr;
+
+    const auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+    const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(ntdll) + dosHeader->e_lfanew);
+
+    auto* base = reinterpret_cast<uint8_t*>(ntdll);
+    const size_t size = ntHeaders->OptionalHeader.SizeOfImage;
+
+    // 4C 8B DC 49 89 5B ? 49 89 73 ? 57 41 54 41 55 41 56 41 57 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 ? ? ? ? 48 8B F9
+    static const uint8_t pattern[] = {
+        0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x00, 0x49,
+        0x89, 0x73, 0x00, 0x57, 0x41, 0x54, 0x41, 0x55,
+        0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x00,
+        0x00, 0x00, 0x00, 0x48, 0x8B, 0x05, 0x00, 0x00,
+        0x00, 0x00, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84,
+        0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF9
+    };
+    static const char mask[] = "xxxxxx?xxx?xxxxxxxxxxx????xxx????xxxxx????xxxxx";
+
+    if (auto* result = PatternScan(base, size, pattern, mask))
+        return reinterpret_cast<LdrpHandleTlsDataFn>(result);
+
+    return nullptr;
+}
+
+} // anonymous namespace
+
+bool satsuma::ManualMapInjector::HandleStaticTLS(const std::unique_ptr<uint8_t[]>& image)
+{
+    const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
+    const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get() + dosHeaders->e_lfanew);
+
+    const auto& tlsDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!tlsDir.Size)
+        return true; // no TLS directory, nothing to do
+
+    static const auto ldrpHandleTlsData = FindLdrpHandleTlsData();
+    if (!ldrpHandleTlsData)
+        return false;
+
+    // Build a fake LDR_DATA_TABLE_ENTRY so LdrpHandleTlsData can read the PE's TLS directory
+    LDR_DATA_TABLE_ENTRY_FULL fakeEntry{};
+    fakeEntry.DllBase = image.get();
+    fakeEntry.SizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
+    fakeEntry.EntryPoint = image.get() + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+
+    // Self-referencing list entries so the loader doesn't walk into invalid memory
+    fakeEntry.InLoadOrderLinks.Flink = &fakeEntry.InLoadOrderLinks;
+    fakeEntry.InLoadOrderLinks.Blink = &fakeEntry.InLoadOrderLinks;
+    fakeEntry.InMemoryOrderLinks.Flink = &fakeEntry.InMemoryOrderLinks;
+    fakeEntry.InMemoryOrderLinks.Blink = &fakeEntry.InMemoryOrderLinks;
+    fakeEntry.InInitializationOrderLinks.Flink = &fakeEntry.InInitializationOrderLinks;
+    fakeEntry.InInitializationOrderLinks.Blink = &fakeEntry.InInitializationOrderLinks;
+    fakeEntry.HashLinks.Flink = &fakeEntry.HashLinks;
+    fakeEntry.HashLinks.Blink = &fakeEntry.HashLinks;
+
+    const NTSTATUS status = ldrpHandleTlsData(&fakeEntry);
+    return status >= 0; // NT_SUCCESS
+}
 
 bool satsuma::ManualMapInjector::IsPortableExecutable(const std::span<uint8_t> &rawDll)
 {
@@ -211,6 +323,9 @@ std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInject
 
     if (!CreateImportTable(imageBaseAddress))
         return std::unexpected("Failed to create Import Table");
+
+    if (!HandleStaticTLS(imageBaseAddress))
+        return std::unexpected("Failed to initialize static TLS via LdrpHandleTlsData");
 
     MaybeCallTLSCallbacks(imageBaseAddress);
     EnableExceptions(imageBaseAddress);
