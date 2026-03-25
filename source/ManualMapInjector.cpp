@@ -9,6 +9,7 @@
 #include <memory>
 #include <Windows.h>
 #include <winternl.h>
+#include <TlHelp32.h>
 #include <thread>
 #include <fstream>
 #include <filesystem>
@@ -122,6 +123,179 @@ RtlInsertInvertedFunctionTableFn FindRtlInsertInvertedFunctionTable()
         return reinterpret_cast<RtlInsertInvertedFunctionTableFn>(result);
 
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Remote injection: shellcode data + self-contained loader
+// ---------------------------------------------------------------------------
+struct RemoteLoaderData {
+    uint8_t* imageBase;
+    DWORD    ntHeadersRva;
+
+    decltype(&LoadLibraryA)        fnLoadLibraryA;
+    decltype(&GetProcAddress)      fnGetProcAddress;
+    decltype(&RtlAddFunctionTable) fnRtlAddFunctionTable;
+    void* fnLdrpHandleTlsData;
+    void* fnRtlInsertInvertedFunctionTable;
+};
+
+// Disable all CRT instrumentation so the function is fully self-contained.
+// No __security_check_cookie, no __RTC_*, no __chkstk references.
+#pragma runtime_checks("", off)
+#pragma optimize("ts", on)
+#pragma strict_gs_check(push, off)
+
+__declspec(safebuffers) __declspec(noinline)
+static DWORD WINAPI RemoteShellcode(RemoteLoaderData* data)
+{
+    auto* base = data->imageBase;
+    auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + data->ntHeadersRva);
+
+    // --- Resolve imports ---
+    auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir.Size)
+    {
+        auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
+        while (desc->Characteristics)
+        {
+            HMODULE hMod = data->fnLoadLibraryA(reinterpret_cast<LPCSTR>(base + desc->Name));
+            if (!hMod) return 1;
+
+            auto* ot = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+            auto* ft = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+
+            while (ot->u1.AddressOfData)
+            {
+                FARPROC fn;
+                if (ot->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                    fn = data->fnGetProcAddress(hMod, reinterpret_cast<LPCSTR>(ot->u1.Ordinal & 0xFFFF));
+                else
+                {
+                    auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + ot->u1.AddressOfData);
+                    fn = data->fnGetProcAddress(hMod, ibn->Name);
+                }
+                if (!fn) return 2;
+                ft->u1.Function = reinterpret_cast<uintptr_t>(fn);
+                ot++;
+                ft++;
+            }
+            desc++;
+        }
+    }
+
+    // --- Handle static TLS ---
+    auto& tlsDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsDir.Size && data->fnLdrpHandleTlsData)
+    {
+        // Build fake LDR_DATA_TABLE_ENTRY on the stack — zero without memset
+        LDR_DATA_TABLE_ENTRY_FULL entry;
+        auto* raw = reinterpret_cast<volatile uint8_t*>(&entry);
+        for (size_t i = 0; i < sizeof(entry); i++)
+            raw[i] = 0;
+
+        entry.DllBase     = base;
+        entry.SizeOfImage = nt->OptionalHeader.SizeOfImage;
+        entry.EntryPoint  = base + nt->OptionalHeader.AddressOfEntryPoint;
+
+        entry.InLoadOrderLinks.Flink              = &entry.InLoadOrderLinks;
+        entry.InLoadOrderLinks.Blink              = &entry.InLoadOrderLinks;
+        entry.InMemoryOrderLinks.Flink            = &entry.InMemoryOrderLinks;
+        entry.InMemoryOrderLinks.Blink            = &entry.InMemoryOrderLinks;
+        entry.InInitializationOrderLinks.Flink    = &entry.InInitializationOrderLinks;
+        entry.InInitializationOrderLinks.Blink    = &entry.InInitializationOrderLinks;
+        entry.HashLinks.Flink                     = &entry.HashLinks;
+        entry.HashLinks.Blink                     = &entry.HashLinks;
+
+        reinterpret_cast<NTSTATUS(NTAPI*)(LDR_DATA_TABLE_ENTRY_FULL*)>(
+            data->fnLdrpHandleTlsData)(&entry);
+    }
+
+    // --- TLS callbacks ---
+    if (tlsDir.Size)
+    {
+        auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(base + tlsDir.VirtualAddress);
+        auto* cb  = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks);
+        for (; cb && *cb; cb++)
+            (*cb)(base, DLL_PROCESS_ATTACH, nullptr);
+    }
+
+    // --- Exception handling ---
+    auto& excDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (excDir.Size)
+    {
+        if (data->fnRtlInsertInvertedFunctionTable)
+        {
+            reinterpret_cast<void(NTAPI*)(PVOID, ULONG)>(
+                data->fnRtlInsertInvertedFunctionTable)(base, nt->OptionalHeader.SizeOfImage);
+        }
+        else
+        {
+            data->fnRtlAddFunctionTable(
+                reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(base + excDir.VirtualAddress),
+                excDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY),
+                reinterpret_cast<uintptr_t>(base));
+        }
+    }
+
+    // --- Call entry point ---
+    if (nt->OptionalHeader.AddressOfEntryPoint)
+    {
+        auto ep = reinterpret_cast<BOOL(WINAPI*)(HMODULE, DWORD, LPVOID)>(
+            base + nt->OptionalHeader.AddressOfEntryPoint);
+        ep(reinterpret_cast<HMODULE>(base), DLL_PROCESS_ATTACH, nullptr);
+    }
+
+    return 0;
+}
+
+static void RemoteShellcodeEnd() { }
+
+#pragma strict_gs_check(pop)
+#pragma runtime_checks("", restore)
+#pragma optimize("", on)
+
+// Resolve MSVC incremental-link jump stubs (ILT): E9 xx xx xx xx → target
+static uint8_t* ResolveILT(void* fn)
+{
+    auto* p = static_cast<uint8_t*>(fn);
+    if (p[0] == 0xE9)
+    {
+        auto rel = *reinterpret_cast<int32_t*>(p + 1);
+        return p + 5 + rel;
+    }
+    return p;
+}
+
+// Apply relocations to a local buffer using an arbitrary target base address
+static void RelocateForBase(uint8_t* localImage, uintptr_t targetBase)
+{
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(localImage);
+    auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(localImage + dos->e_lfanew);
+
+    const auto delta = static_cast<intptr_t>(targetBase - nt->OptionalHeader.ImageBase);
+    if (delta == 0)
+        return;
+
+    auto& relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (!relocDir.Size)
+        return;
+
+    auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(localImage + relocDir.VirtualAddress);
+    while (block->SizeOfBlock && block->VirtualAddress)
+    {
+        const size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        auto* info = reinterpret_cast<uint16_t*>(block + 1);
+        for (size_t i = 0; i < count; i++, info++)
+        {
+            if (!RELOC_FLAG(*info))
+                continue;
+            auto* patch = reinterpret_cast<uintptr_t*>(localImage + block->VirtualAddress + (*info & 0xFFF));
+            *patch += delta;
+        }
+        block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
+    }
+
+    nt->OptionalHeader.ImageBase = targetBase;
 }
 
 } // anonymous namespace
@@ -386,4 +560,182 @@ std::expected<satsuma::ImagePtr, std::string>  satsuma::ManualMapInjector::Injec
     file.read(reinterpret_cast<char *>(data.data()), data.size());
 
     return InjectFromRaw({data.data(), data.size()});
+}
+
+// =========================================================================
+// Remote injection
+// =========================================================================
+
+DWORD satsuma::ManualMapInjector::FindProcessId(const std::string &processName)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+
+    PROCESSENTRY32 pe{};
+    pe.dwSize = sizeof(pe);
+
+    DWORD pid = 0;
+    if (Process32First(snap, &pe))
+    {
+        do
+        {
+            if (_stricmp(pe.szExeFile, processName.c_str()) == 0)
+            {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32Next(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return pid;
+}
+
+std::expected<uintptr_t, std::string>
+satsuma::ManualMapInjector::InjectRemoteFromRaw(const std::span<uint8_t> &rawDll, DWORD processId)
+{
+    if (!IsPortableExecutable(rawDll))
+        return std::unexpected("File is not in a Portable Executable format");
+
+    // Open target process
+    HANDLE hProcess = OpenProcess(
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+        FALSE, processId);
+
+    if (!hProcess)
+        return std::unexpected("Failed to open target process (error " + std::to_string(GetLastError()) + ")");
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
+    const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data() + dos->e_lfanew);
+    const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+
+    // Allocate image memory in target process
+    auto* remoteImage = static_cast<uint8_t*>(VirtualAllocEx(
+        hProcess, nullptr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+
+    if (!remoteImage)
+    {
+        CloseHandle(hProcess);
+        return std::unexpected("VirtualAllocEx failed for image (error " + std::to_string(GetLastError()) + ")");
+    }
+
+    // Prepare local copy: headers + sections
+    std::vector<uint8_t> localImage(imageSize, 0);
+    std::copy_n(rawDll.data(), nt->OptionalHeader.SizeOfHeaders, localImage.data());
+
+    auto* secHeader = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, secHeader++)
+    {
+        if (!secHeader->SizeOfRawData)
+            continue;
+        std::copy_n(rawDll.data() + secHeader->PointerToRawData,
+                     secHeader->SizeOfRawData,
+                     localImage.data() + secHeader->VirtualAddress);
+    }
+
+    // Relocate for remote base address
+    RelocateForBase(localImage.data(), reinterpret_cast<uintptr_t>(remoteImage));
+
+    // Write image to target
+    if (!WriteProcessMemory(hProcess, remoteImage, localImage.data(), imageSize, nullptr))
+    {
+        VirtualFreeEx(hProcess, remoteImage, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return std::unexpected("WriteProcessMemory failed for image");
+    }
+
+    // Prepare shellcode page: [RemoteLoaderData | padding | shellcode bytes]
+    auto* scBody  = ResolveILT(reinterpret_cast<void*>(&RemoteShellcode));
+    auto* scEnd   = ResolveILT(reinterpret_cast<void*>(&RemoteShellcodeEnd));
+    size_t scSize = static_cast<size_t>(scEnd - scBody);
+    if (scSize < 0x100) scSize = 0x1000; // safety floor
+
+    constexpr size_t dataAligned = (sizeof(RemoteLoaderData) + 0xF) & ~0xF;
+    const size_t totalShellcode  = dataAligned + scSize;
+
+    auto* remoteShellcode = static_cast<uint8_t*>(VirtualAllocEx(
+        hProcess, nullptr, totalShellcode, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+
+    if (!remoteShellcode)
+    {
+        VirtualFreeEx(hProcess, remoteImage, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return std::unexpected("VirtualAllocEx failed for shellcode");
+    }
+
+    // Fill loader data
+    // ntdll and kernel32 are mapped at the same base in every process (per boot),
+    // so our local function pointers are valid in the target.
+    auto* localDos = reinterpret_cast<IMAGE_DOS_HEADER*>(localImage.data());
+
+    RemoteLoaderData loaderData{};
+    loaderData.imageBase      = remoteImage;
+    loaderData.ntHeadersRva   = static_cast<DWORD>(localDos->e_lfanew);
+    loaderData.fnLoadLibraryA = LoadLibraryA;
+    loaderData.fnGetProcAddress = GetProcAddress;
+    loaderData.fnRtlAddFunctionTable = RtlAddFunctionTable;
+    loaderData.fnLdrpHandleTlsData = reinterpret_cast<void*>(FindLdrpHandleTlsData());
+    loaderData.fnRtlInsertInvertedFunctionTable = reinterpret_cast<void*>(FindRtlInsertInvertedFunctionTable());
+
+    // Build local shellcode page
+    std::vector<uint8_t> scPage(totalShellcode, 0);
+    std::memcpy(scPage.data(), &loaderData, sizeof(loaderData));
+    std::memcpy(scPage.data() + dataAligned, scBody, scSize);
+
+    // Write shellcode page to target
+    if (!WriteProcessMemory(hProcess, remoteShellcode, scPage.data(), totalShellcode, nullptr))
+    {
+        VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteImage, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return std::unexpected("WriteProcessMemory failed for shellcode");
+    }
+
+    // Create remote thread: entry = shellcode code, param = RemoteLoaderData*
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteShellcode + dataAligned),
+        remoteShellcode, // lpParameter → points to RemoteLoaderData
+        0, nullptr);
+
+    if (!hThread)
+    {
+        VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteImage, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return std::unexpected("CreateRemoteThread failed (error " + std::to_string(GetLastError()) + ")");
+    }
+
+    WaitForSingleObject(hThread, INFINITE);
+
+    DWORD exitCode = 0;
+    GetExitCodeThread(hThread, &exitCode);
+    CloseHandle(hThread);
+
+    // Free shellcode page — no longer needed after init
+    VirtualFreeEx(hProcess, remoteShellcode, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+
+    if (exitCode != 0)
+        return std::unexpected("Remote shellcode failed (exit code " + std::to_string(exitCode) + ")");
+
+    return reinterpret_cast<uintptr_t>(remoteImage);
+}
+
+std::expected<uintptr_t, std::string>
+satsuma::ManualMapInjector::InjectRemoteFromFile(const std::string &pathToDll, const std::string &processName)
+{
+    const DWORD pid = FindProcessId(processName);
+    if (!pid)
+        return std::unexpected("Process \"" + processName + "\" not found");
+
+    std::vector<uint8_t> data(std::filesystem::file_size(pathToDll), 0);
+    std::ifstream file(pathToDll, std::ios::binary);
+    if (!file.is_open())
+        return std::unexpected("Failed to open DLL file");
+
+    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return InjectRemoteFromRaw({data.data(), data.size()}, pid);
 }

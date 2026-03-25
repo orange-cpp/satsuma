@@ -32,6 +32,15 @@ namespace satsuma
         [[nodiscard]]
         static std::expected<ImagePtr, std::string> InjectFromFile(const std::string &pathToDll);
 
+        [[nodiscard]]
+        static std::expected<uintptr_t, std::string> InjectRemoteFromRaw(const std::span<uint8_t> &rawDll, DWORD processId);
+
+        [[nodiscard]]
+        static std::expected<uintptr_t, std::string> InjectRemoteFromFile(const std::string &pathToDll, const std::string &processName);
+
+        [[nodiscard]]
+        static DWORD FindProcessId(const std::string &processName);
+
     private:
         [[nodiscard]]
         static bool IsPortableExecutable(const std::span<uint8_t> &rawDll);

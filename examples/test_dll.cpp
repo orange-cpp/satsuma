@@ -541,5 +541,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
     printf("[test_dll] Results: %d/%d passed\n", g_passed, g_total);
     printf("========================================\n");
 
+    MessageBoxA(nullptr, "All tests have passed!", "Yey", MB_OK);
     return TRUE;
 }

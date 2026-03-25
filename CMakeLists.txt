@@ -14,3 +14,6 @@ add_library(test_dll SHARED examples/test_dll.cpp)
 
 add_executable(loader examples/loader.cpp)
 target_link_libraries(loader PRIVATE satsuma)
+
+add_executable(remote_loader examples/remote_loader.cpp)
+target_link_libraries(remote_loader PRIVATE satsuma)
