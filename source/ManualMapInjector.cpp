@@ -211,7 +211,7 @@ void satsuma::ManualMapInjector::MaybeRelocate(const satsuma::ImagePtr &image)
         const size_t entries = (currentBaseRelocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
         auto relativeInfo = reinterpret_cast<uint16_t*>(currentBaseRelocation + 1);
 
-        for (size_t i = 0; i <= entries; i++, relativeInfo++)
+        for (size_t i = 0; i < entries; i++, relativeInfo++)
         {
             if (!RELOC_FLAG(*relativeInfo))
                 continue;
@@ -351,9 +351,10 @@ std::expected<satsuma::ImagePtr, std::string>  satsuma::ManualMapInjector::Injec
 
     auto imageBaseAddress = AllocatePortableExecutableImage(rawDll);
 
-    constexpr size_t sizeOfHeader = 0x1000;
+    const auto* dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
+    const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data() + dosHeaders->e_lfanew);
 
-    std::ranges::copy_n(rawDll.cbegin(), sizeOfHeader, imageBaseAddress.get());
+    std::ranges::copy_n(rawDll.cbegin(), ntHeaders->OptionalHeader.SizeOfHeaders, imageBaseAddress.get());
 
     CopyPages(rawDll, imageBaseAddress);
     MaybeRelocate(imageBaseAddress);
