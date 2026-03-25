@@ -42,6 +42,7 @@ struct LDR_DATA_TABLE_ENTRY_FULL {
 };
 
 using LdrpHandleTlsDataFn = NTSTATUS(NTAPI*)(LDR_DATA_TABLE_ENTRY_FULL*);
+using RtlInsertInvertedFunctionTableFn = void(NTAPI*)(PVOID ImageBase, ULONG SizeOfImage);
 
 uint8_t* PatternScan(uint8_t* base, size_t size, const uint8_t* pattern, const char* mask)
 {
@@ -96,9 +97,36 @@ LdrpHandleTlsDataFn FindLdrpHandleTlsData()
     return nullptr;
 }
 
+RtlInsertInvertedFunctionTableFn FindRtlInsertInvertedFunctionTable()
+{
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return nullptr;
+
+    const auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+    const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(ntdll) + dosHeader->e_lfanew);
+
+    auto* base = reinterpret_cast<uint8_t*>(ntdll);
+    const size_t size = ntHeaders->OptionalHeader.SizeOfImage;
+
+    // 48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 48 83 EC ? 83 60
+    static const uint8_t pattern[] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x00, 0x48,
+        0x89, 0x68, 0x00, 0x48, 0x89, 0x70, 0x00, 0x57,
+        0x48, 0x83, 0xEC, 0x00, 0x83, 0x60
+    };
+    static const char mask[] = "xxxxxx?xxx?xxx?xxxx?xx";
+
+    if (auto* result = PatternScan(base, size, pattern, mask))
+        return reinterpret_cast<RtlInsertInvertedFunctionTableFn>(result);
+
+    return nullptr;
+}
+
 } // anonymous namespace
 
-bool satsuma::ManualMapInjector::HandleStaticTLS(const std::unique_ptr<uint8_t[]>& image)
+bool satsuma::ManualMapInjector::HandleStaticTLS(const satsuma::ImagePtr& image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get() + dosHeaders->e_lfanew);
@@ -147,23 +175,21 @@ bool satsuma::ManualMapInjector::IsPortableExecutable(const std::span<uint8_t> &
     return true;
 }
 
-std::unique_ptr<uint8_t[]> satsuma::ManualMapInjector::AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll)
+satsuma::ImagePtr satsuma::ManualMapInjector::AllocatePortableExecutableImage(const std::span<uint8_t> &rawDll)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data()+dosHeaders->e_lfanew);
 
-    auto imageBaseAddress = std::make_unique<uint8_t[]>(ntHeaders->OptionalHeader.SizeOfImage);
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, ntHeaders->OptionalHeader.SizeOfImage,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
 
-    if (!imageBaseAddress)
-        assert(false);
+    assert(mem);
 
-    DWORD oldProc;
-    VirtualProtect(imageBaseAddress.get(), ntHeaders->OptionalHeader.SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProc);
-
-    return imageBaseAddress;
+    return ImagePtr(mem);
 }
 
-void satsuma::ManualMapInjector::MaybeRelocate(const std::unique_ptr<uint8_t[]> &image)
+void satsuma::ManualMapInjector::MaybeRelocate(const satsuma::ImagePtr &image)
 {
 
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
@@ -197,7 +223,7 @@ void satsuma::ManualMapInjector::MaybeRelocate(const std::unique_ptr<uint8_t[]> 
     }
 }
 
-void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, const std::unique_ptr<uint8_t[]> &image)
+void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, const satsuma::ImagePtr &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawDll.data());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawDll.data()+dosHeaders->e_lfanew);
@@ -215,7 +241,7 @@ void satsuma::ManualMapInjector::CopyPages(const std::span<uint8_t> &rawDll, con
 }
 
 
-bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t[]> &image)
+bool satsuma::ManualMapInjector::CreateImportTable(const satsuma::ImagePtr &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
@@ -262,7 +288,7 @@ bool satsuma::ManualMapInjector::CreateImportTable(const std::unique_ptr<uint8_t
     return true;
 }
 
-void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const std::unique_ptr<uint8_t[]> &image)
+void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const satsuma::ImagePtr &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
@@ -279,7 +305,7 @@ void satsuma::ManualMapInjector::MaybeCallTLSCallbacks(const std::unique_ptr<uin
         (*callBack)(image.get(), DLL_PROCESS_ATTACH, nullptr);
 }
 
-void satsuma::ManualMapInjector::EnableExceptions(const std::unique_ptr<uint8_t[]> &image)
+void satsuma::ManualMapInjector::EnableExceptions(const satsuma::ImagePtr &image)
 {
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
     const auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(image.get()+dosHeaders->e_lfanew);
@@ -288,11 +314,22 @@ void satsuma::ManualMapInjector::EnableExceptions(const std::unique_ptr<uint8_t[
     if (!Size)
         return;
 
+    // RtlInsertInvertedFunctionTable registers the image in ntdll's inverted function
+    // table, which is what the MSVC C++ exception runtime (__CxxFrameHandler) uses.
+    // RtlAddFunctionTable only covers SEH — C++ exceptions need the inverted table.
+    static const auto rtlInsertInvertedFunctionTable = FindRtlInsertInvertedFunctionTable();
+    if (rtlInsertInvertedFunctionTable)
+    {
+        rtlInsertInvertedFunctionTable(image.get(), ntHeaders->OptionalHeader.SizeOfImage);
+        return;
+    }
+
+    // Fallback: at least SEH will work
     RtlAddFunctionTable(reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(image.get() + VirtualAddress),
             Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), reinterpret_cast<uintptr_t>(image.get()));
 }
 
-std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInjector::MaybeGetEntryPoint(const std::unique_ptr<uint8_t[]>& image)
+std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInjector::MaybeGetEntryPoint(const satsuma::ImagePtr& image)
 {
 
     const auto dosHeaders = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.get());
@@ -306,7 +343,7 @@ std::optional<std::function<int(HMODULE, DWORD, LPVOID)>> satsuma::ManualMapInje
     return reinterpret_cast<dllmain>(image.get() + ntHeaders->OptionalHeader.AddressOfEntryPoint);
 }
 
-std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll)
+std::expected<satsuma::ImagePtr, std::string>  satsuma::ManualMapInjector::InjectFromRaw(const std::span<uint8_t> &rawDll)
 {
 
     if (!IsPortableExecutable(rawDll))
@@ -336,7 +373,7 @@ std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInject
     return imageBaseAddress;
 }
 
-std::expected<std::unique_ptr<uint8_t[]>, std::string>  satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll)
+std::expected<satsuma::ImagePtr, std::string>  satsuma::ManualMapInjector::InjectFromFile(const std::string &pathToDll)
 {
     std::vector<uint8_t> data(std::filesystem::file_size(pathToDll), 0);
 
